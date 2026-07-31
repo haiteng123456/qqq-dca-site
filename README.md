@@ -1,18 +1,23 @@
-# QQQ 180日定投成本静态站
+# 热门美股 180 日定投成本静态站
 
-这个项目会每天更新 QQQ 收盘价，并计算“当天之前 180 个交易日”的固定金额定投成本。
+这个项目会更新一批纳斯达克 100 和标普 500 热门股票的收盘价，并计算最近 180 个交易日的固定金额定投成本、180 日均线、价格偏离和窗口回撤。
 
 ## 本地更新
 
-```powershell
-cd D:\AliWorkbenchData\qqq-dca-site
-python .\scripts\update_qqq.py --seed ..\qqq_prices_inception_to_2026-06-10.csv
+```bash
+python scripts/update_qqq.py
 ```
 
-然后启动一个本地静态服务器：
+只更新指定代码：
 
-```powershell
-cd D:\AliWorkbenchData\qqq-dca-site\public
+```bash
+python scripts/update_qqq.py --symbols QQQ,NVDA,AAPL
+```
+
+启动本地静态服务器：
+
+```bash
+cd public
 python -m http.server 8080
 ```
 
@@ -26,10 +31,10 @@ http://127.0.0.1:8080/
 
 `.github/workflows/update-data.yml` 会在美股收盘后自动运行：
 
-1. 拉取 Yahoo Finance 的 QQQ 日线数据
-2. 更新 `data/qqq_prices.csv`
-3. 重新计算 `data/qqq_180d_dca.csv`
-4. 生成网页使用的 `public/data/qqq_180d_dca.json` 和 `public/data/qqq_180d_dca.js`
+1. 拉取 Yahoo Finance 日线数据
+2. 更新 `data/prices/*.csv`
+3. 计算 `data/*_180d_dca.csv`
+4. 生成网页使用的 `public/data/market_dca.json` 和 `public/data/market_dca.js`
 5. 提交更新并部署到 GitHub Pages
 
 ## Cloudflare Pages 部署
@@ -48,8 +53,7 @@ https://qqq-dca-site.pages.dev/
 
 手动重新部署：
 
-```powershell
-cd D:\AliWorkbenchData\qqq-dca-site
+```bash
 npx wrangler pages deploy public --project-name qqq-dca-site --branch main --commit-dirty=true
 ```
 
@@ -61,4 +65,4 @@ npx wrangler pages deploy public --project-name qqq-dca-site --branch main --com
 180 / sum(1 / close_i)
 ```
 
-其中 `close_i` 是目标日期之前 180 个交易日的 QQQ 收盘价。
+其中 `close_i` 是最近 180 个交易日的收盘价。180 日均线是同一窗口的算术平均价。

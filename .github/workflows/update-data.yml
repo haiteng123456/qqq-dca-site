@@ -1,4 +1,4 @@
-name: Update QQQ DCA site
+name: Update market DCA site
 
 on:
   schedule:
@@ -23,13 +23,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Update QQQ data
+      - name: Update market data
         run: python scripts/update_qqq.py
       - name: Commit data changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Update QQQ 180-day DCA data"
-          file_pattern: "data/*.csv public/data/*"
+          commit_message: "Update market 180-day DCA data"
+          file_pattern: "data/**/*.csv data/*.csv public/data/*"
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
