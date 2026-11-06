@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import sys
@@ -23,6 +24,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 WINDOW_DAYS = 180
@@ -33,6 +35,9 @@ PRICE_DIR = DATA_DIR / "prices"
 PUBLIC_DATA_DIR = PROJECT_ROOT / "public" / "data"
 MARKET_JSON = PUBLIC_DATA_DIR / "market_dca.json"
 MARKET_JS = PUBLIC_DATA_DIR / "market_dca.js"
+PRIORITY_SYMBOLS = ("QQQ", "SPY")
+PRIORITY_SERIES_ROWS = 270
+INDEX_HISTORY_START = "2000-01-01"
 
 # Compatibility outputs used by the original single-QQQ site.
 QQQ_PRICE_CSV = DATA_DIR / "qqq_prices.csv"
@@ -100,6 +105,14 @@ def unix_seconds(day: date) -> int:
     return int(datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp())
 
 
+def latest_completed_market_date(now: datetime | None = None) -> date:
+    market_now = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
+    day = market_now.date()
+    if (market_now.hour, market_now.minute) < (16, 15):
+        day -= timedelta(days=1)
+    return day
+
+
 def safe_float(value: object) -> float | None:
     if value is None:
         return None
@@ -124,17 +137,27 @@ def fetch_yahoo_prices(symbol: str, start: date, end_exclusive: date) -> list[Pr
         "events": "history",
         "includeAdjustedClose": "true",
     }
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(symbol)}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(
-        url,
-        headers={
+    for attempt, host in enumerate(("query1.finance.yahoo.com", "query2.finance.yahoo.com", "query1.finance.yahoo.com")):
+        url = f"https://{host}/v8/finance/chart/{urllib.parse.quote(symbol)}?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(url, headers={
             "User-Agent": "Mozilla/5.0 investment-dca-site/2.0",
             "Accept": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=35) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    return parse_yahoo_chart_payload(payload)
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=35) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            rows = parse_yahoo_chart_payload(payload)
+            if not rows:
+                raise RuntimeError(f"No price data returned for {symbol}")
+            if any(not math.isfinite(row.close) or row.close <= 0 for row in rows):
+                raise RuntimeError(f"Invalid closing price returned for {symbol}")
+            return rows
+        except Exception:
+            if attempt == 2:
+                raise
+            print(f"Network error for {symbol}; retry {attempt + 1}/2", file=sys.stderr, flush=True)
+            time.sleep(2 ** (attempt + 1))
+    raise RuntimeError(f"Unable to fetch {symbol}")
 
 
 def parse_yahoo_chart_payload(payload: dict[str, Any]) -> list[PriceRow]:
@@ -315,7 +338,7 @@ def write_symbol_csv(symbol: str, rows: list[dict[str, Any]]) -> None:
             writer.writerow({field: row[field] for field in fields})
 
 
-def compact_public_rows(rows: list[dict[str, Any]]) -> list[list[Any]]:
+def compact_public_rows(rows: list[dict[str, Any]], limit: int | None = PUBLIC_SERIES_ROWS) -> list[list[Any]]:
     return [
         [
             row["date"],
@@ -334,8 +357,45 @@ def compact_public_rows(rows: list[dict[str, Any]]) -> list[list[Any]]:
             row["zone"]["label"],
             row["zone"]["tone"],
         ]
-        for row in rows[-PUBLIC_SERIES_ROWS:]
+        for row in (rows[-limit:] if limit is not None else rows)
     ]
+
+
+def write_incremental_public_data(payload: dict[str, Any]) -> None:
+    series_dir = PUBLIC_DATA_DIR / "series"
+    series_dir.mkdir(parents=True, exist_ok=True)
+    history_paths: dict[str, str] = {}
+    for symbol, rows in payload["series"].items():
+        content = json.dumps({"symbol": symbol, "rows": rows}, ensure_ascii=False, separators=(",", ":")) + "\n"
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+        filename = f"{symbol}.{digest}.json"
+        (series_dir / filename).write_text(content, encoding="utf-8")
+        history_paths[symbol] = f"./data/series/{filename}"
+
+    rank = {symbol: i for i, symbol in enumerate(PRIORITY_SYMBOLS)}
+    summaries = sorted(payload["symbols"], key=lambda item: (rank.get(item["symbol"], 2), item["symbol"]))
+    summary = {
+        "updatedAt": payload["updatedAt"],
+        "symbols": summaries,
+        "historyPaths": history_paths,
+    }
+    content = json.dumps(summary, ensure_ascii=False, separators=(",", ":")) + "\n"
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+    summary_filename = f"market_summary.{digest}.json"
+    (PUBLIC_DATA_DIR / summary_filename).write_text(content, encoding="utf-8")
+    priority_symbols = [symbol for symbol in PRIORITY_SYMBOLS if symbol in history_paths]
+    if not priority_symbols:
+        priority_symbols = [item["symbol"] for item in summaries[:2]]
+    priority = {
+        "updatedAt": payload["updatedAt"],
+        "symbols": [item for item in summaries if item["symbol"] in priority_symbols],
+        "series": {symbol: rows[-PRIORITY_SERIES_ROWS:] for symbol, rows in payload["series"].items() if symbol in priority_symbols},
+        "historyPaths": {symbol: path for symbol, path in history_paths.items() if symbol in priority_symbols},
+        "summaryPath": f"./data/{summary_filename}",
+    }
+    (PUBLIC_DATA_DIR / "market_priority.json").write_text(
+        json.dumps(priority, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
 
 
 def write_qqq_compat(prices: list[PriceRow], rows: list[dict[str, Any]], payload: dict[str, Any]) -> None:
@@ -364,9 +424,12 @@ def update_symbol(meta: dict[str, str], as_of: date, no_fetch: bool) -> tuple[di
 
     if not no_fetch:
         start = parse_date(prices[-1].date) - timedelta(days=10) if prices else date(2010, 1, 1)
-        end = as_of + timedelta(days=2)
+        if symbol in PRIORITY_SYMBOLS and (not prices or prices[0].date > INDEX_HISTORY_START):
+            # The pre-2000 buffer supplies a complete 180-session window for January 2000.
+            start = date(1999, 1, 1)
+        end = as_of + timedelta(days=1)
         fetched = fetch_yahoo_prices(symbol, start, end)
-        prices = merge_prices(prices, fetched)
+        prices = [row for row in merge_prices(prices, fetched) if parse_date(row.date) <= as_of]
         time.sleep(0.2)
 
     if len(prices) < WINDOW_DAYS:
@@ -388,14 +451,19 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    as_of = parse_date(args.as_of) if args.as_of else date.today()
+    as_of = parse_date(args.as_of) if args.as_of else latest_completed_market_date()
     wanted = {item.strip().upper() for item in args.symbols.split(",")} if args.symbols else None
+    if wanted and (unknown := wanted - {meta["symbol"] for meta in SYMBOLS}):
+        parser.error(f"Unknown symbols: {', '.join(sorted(unknown))}")
     metas = [meta for meta in SYMBOLS if wanted is None or meta["symbol"].upper() in wanted]
+
+    previous = json.loads(MARKET_JSON.read_text(encoding="utf-8")) if MARKET_JSON.exists() else {}
 
     PUBLIC_DATA_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    summaries: list[dict[str, Any]] = []
-    series: dict[str, list[list[Any]]] = {}
+    by_symbol = {item["symbol"]: item for item in previous.get("symbols", [])} if wanted else {}
+    series: dict[str, list[list[Any]]] = dict(previous.get("series", {})) if wanted else {}
+    updated_count = 0
     errors: list[str] = []
     qqq_prices: list[PriceRow] = []
     qqq_rows: list[dict[str, Any]] = []
@@ -415,17 +483,29 @@ def main() -> int:
             continue
 
         assert summary is not None
-        summaries.append(summary)
-        series[symbol] = compact_public_rows(rows)
+        by_symbol[symbol] = summary
+        updated_count += 1
+        series[symbol] = compact_public_rows(
+            [row for row in rows if row["date"] >= INDEX_HISTORY_START], limit=None
+        ) if symbol in PRIORITY_SYMBOLS else compact_public_rows(rows)
         if symbol == "QQQ":
             qqq_prices = prices
             qqq_rows = rows
         print(f"Updated {symbol}: {len(prices)} prices, latest {rows[-1]['date']}")
 
-    summaries.sort(key=lambda item: (item["index"] != "Nasdaq 100", item["symbol"]))
+    if not updated_count or (wanted and errors):
+        print("Update incomplete. Existing public data has not been replaced.", file=sys.stderr)
+        return 1
+
+    summaries = sorted(by_symbol.values(), key=lambda item: (item["index"] != "Nasdaq 100", item["symbol"]))
+    if previous.get("symbols") == summaries and previous.get("series") == series and not errors:
+        print(f"No market data changes for {updated_count} symbols. Existing public data preserved.")
+        return 0
     payload = {
         "windowTradingDays": WINDOW_DAYS,
         "publicSeriesRows": PUBLIC_SERIES_ROWS,
+        "indexHistoryStart": INDEX_HISTORY_START,
+        "fullHistorySymbols": list(PRIORITY_SYMBOLS),
         "updatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source": "Yahoo Finance chart endpoint",
         "seriesColumns": [
@@ -452,16 +532,13 @@ def main() -> int:
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     MARKET_JSON.write_text(text + "\n", encoding="utf-8")
     MARKET_JS.write_text("window.MARKET_DCA_DATA = " + text + ";\n", encoding="utf-8")
+    write_incremental_public_data(payload)
 
     if qqq_prices and qqq_rows:
         write_qqq_compat(qqq_prices, qqq_rows, payload)
 
-    if not summaries:
-        print("No symbols updated.", file=sys.stderr)
-        return 1
-
-    print(f"Updated {len(summaries)} symbols. Errors: {len(errors)}")
-    return 0 if len(summaries) >= max(1, len(metas) // 2) else 1
+    print(f"Updated {updated_count} symbols; retained {len(summaries)} total. Errors: {len(errors)}")
+    return 0 if updated_count >= max(1, len(metas) // 2) else 1
 
 
 if __name__ == "__main__":

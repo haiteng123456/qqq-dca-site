@@ -57,7 +57,8 @@
       border-radius: 8px;
       padding: 10px 12px;
       color: var(--muted);
-      white-space: nowrap;
+      max-width: 100%;
+      overflow-wrap: anywhere;
       font-size: 13px;
     }
     .layout {
@@ -67,6 +68,7 @@
       align-items: start;
     }
     .panel {
+      min-width: 0;
       background: var(--surface);
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -141,6 +143,7 @@
     }
     .heat.hot { color: var(--red); }
     .dashboard {
+      min-width: 0;
       display: grid;
       gap: 14px;
     }
@@ -350,7 +353,7 @@
         <h1>热门美股 180 日定投成本</h1>
         <p class="subline">覆盖一批纳斯达克 100 和标普 500 热门股票，按最近 180 个交易日计算固定金额定投成本，并和 180 日均线、当前偏离、窗口回撤一起看。</p>
       </div>
-      <div class="update-pill" id="updated">数据加载中</div>
+      <div class="update-pill" id="updated" role="status" aria-live="polite">指数数据加载中</div>
     </div>
 
     <div class="layout">
@@ -417,10 +420,14 @@
                 <button data-range="1y" class="active">1年</button>
                 <button data-range="3y">3年</button>
                 <button data-range="5y">5年</button>
+                <button data-range="10y" data-index-history hidden>10年</button>
+                <button data-range="20y" data-index-history hidden>20年</button>
+                <button data-range="all" data-index-history hidden>全部</button>
               </div>
             </div>
           </div>
-          <canvas id="chart"></canvas>
+          <button type="button" id="retryData" hidden>重试</button>
+          <canvas id="chart" aria-label="历史收盘价和定投成本走势图"></canvas>
           <div id="tooltip"></div>
         </section>
 
@@ -501,11 +508,11 @@
     </p>
   </main>
 
-  <script src="./data/market_dca.js"></script>
   <script>
-    const payload = window.MARKET_DCA_DATA;
-    const symbols = payload.symbols;
-    const series = payload.series;
+    let payload;
+    let symbols = [];
+    const series = {};
+    const historyPaths = {};
     const fmt = new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     const pct = new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     const compact = new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 });
@@ -516,12 +523,111 @@
     const canvas = document.querySelector("#chart");
     const tooltip = document.querySelector("#tooltip");
     const ctx = canvas.getContext("2d");
-    let selectedSymbol = localStorage.getItem("selectedSymbol") || "NVDA";
+    let selectedSymbol = "QQQ";
     let activeRange = "1y";
     let points = [];
     const rowCache = new Map();
+    const fullHistory = new Set();
+    const historyRequests = new Map();
+    const retryButton = document.querySelector("#retryData");
+    let summaryLoaded = false;
+    let summaryRequest;
+    let requestVersion = 0;
+    let retryAction = () => start();
 
-    document.querySelector("#updated").textContent = `更新于 ${new Date(payload.updatedAt).toLocaleString("zh-CN")}`;
+    async function fetchData(url, onRetry = () => {}, timeoutMs = 12000) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const response = await fetch(url, { signal: controller.signal });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return await response.json();
+        } catch (error) {
+          if (attempt === 2) throw error;
+          onRetry(attempt + 1);
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+    }
+
+    function showFailure(message, action) {
+      document.querySelector("#chartSubtitle").textContent = message;
+      retryAction = action;
+      retryButton.hidden = false;
+    }
+
+    async function loadSummary() {
+      if (summaryLoaded) return;
+      if (summaryRequest) return summaryRequest;
+      summaryRequest = (async () => {
+        const summary = await fetchData(payload.summaryPath);
+        if (summary.updatedAt !== payload.updatedAt) throw new Error("Data version mismatch");
+        symbols = summary.symbols;
+        Object.assign(historyPaths, summary.historyPaths);
+        summaryLoaded = true;
+        renderSymbols();
+        renderRankings();
+      })();
+      try {
+        await summaryRequest;
+      } finally {
+        summaryRequest = null;
+      }
+    }
+
+    async function loadHistory(symbol, version) {
+      if (!historyRequests.has(symbol)) {
+        const request = fetchData(historyPaths[symbol], attempt => {
+          if (selectedSymbol === symbol) {
+            document.querySelector("#chartSubtitle").textContent = `网络异常，正在重试（${attempt}/2）`;
+          }
+        }, 30000).then(data => {
+          if (data.symbol !== symbol || !Array.isArray(data.rows) || !data.rows.length) throw new Error("Invalid history");
+          series[symbol] = data.rows;
+          rowCache.delete(symbol);
+          fullHistory.add(symbol);
+        }).finally(() => historyRequests.delete(symbol));
+        historyRequests.set(symbol, request);
+      }
+      try {
+        await historyRequests.get(symbol);
+        if (selectedSymbol === symbol && version === requestVersion) render();
+      } catch (error) {
+        if (selectedSymbol === symbol && version === requestVersion) {
+          showFailure("历史数据暂时无法加载", () => render());
+        }
+      }
+    }
+
+    async function start() {
+      retryButton.hidden = true;
+      document.querySelector("#updated").textContent = "指数数据加载中";
+      try {
+        payload = await fetchData("./data/market_priority.json", attempt => {
+          document.querySelector("#updated").textContent = `网络异常，正在重试（${attempt}/2）`;
+        });
+        if (!payload.symbols.length) throw new Error("No index data");
+        symbols = payload.symbols;
+        Object.assign(series, payload.series);
+        rowCache.clear();
+        Object.assign(historyPaths, payload.historyPaths);
+        document.querySelector("#updated").textContent = `更新于 ${new Date(payload.updatedAt).toLocaleString("zh-CN")}`;
+        render();
+        // Let both index charts become usable before requesting the remaining summaries.
+        requestAnimationFrame(() => setTimeout(() => loadSummary().catch(() => {
+          showFailure("指数已就绪，其他股票暂时无法加载", async () => {
+            retryButton.hidden = true;
+            try { await loadSummary(); render(); }
+            catch (error) { showFailure("其他股票暂时无法加载", retryAction); }
+          });
+        }), 0));
+      } catch (error) {
+        document.querySelector("#updated").textContent = "网络异常，指数数据未能加载";
+        showFailure("指数数据暂时无法加载", () => start());
+      }
+    }
 
     function getMeta(symbol) {
       return symbols.find(item => item.symbol === symbol) || symbols[0];
@@ -550,8 +656,7 @@
     }
 
     function latestOf(symbol) {
-      const rows = getRows(symbol);
-      return rows[rows.length - 1];
+      return getMeta(symbol)?.latest;
     }
 
     function gapText(value) {
@@ -590,7 +695,6 @@
         `;
         button.addEventListener("click", () => {
           selectedSymbol = item.symbol;
-          localStorage.setItem("selectedSymbol", selectedSymbol);
           render();
         });
         symbolList.appendChild(button);
@@ -598,6 +702,7 @@
     }
 
     function renderSummary(meta, latest, rows) {
+      const chartRows = rows.length ? filterRows(rows, activeRange) : [];
       document.querySelector("#latestPrice").textContent = fmt.format(latest.close);
       document.querySelector("#latestDate").textContent = `交易日 ${latest.date}`;
       document.querySelector("#latestDca").textContent = fmt.format(latest.fixed_amount_dca_cost);
@@ -611,7 +716,9 @@
       zone.className = `zone ${latest.zone.tone}`;
       document.querySelector("#drawdown").textContent = `距180日高点 ${signedPct(latest.drawdown_from_window_high_pct)}，成交量 ${compact.format(latest.volume)}`;
       document.querySelector("#chartTitle").textContent = `${meta.symbol} · ${meta.name}`;
-      document.querySelector("#chartSubtitle").textContent = `${meta.index} · ${meta.sector} · 图表样本 ${rows[0].date} 至 ${rows[rows.length - 1].date}`;
+      document.querySelector("#chartSubtitle").textContent = chartRows.length
+        ? `${meta.index} · ${meta.sector} · 图表样本 ${chartRows[0].date} 至 ${chartRows[chartRows.length - 1].date}`
+        : `${meta.index} · ${meta.sector} · 历史数据加载中`;
       document.querySelector("#tableTitle").textContent = `${meta.symbol} 的最近交易日明细`;
     }
 
@@ -662,10 +769,11 @@
 
     function filterRows(rows, range) {
       if (range === "all") return rows;
-      const days = range === "6m" ? 183 : range === "1y" ? 366 : range === "3y" ? 366 * 3 : 366 * 5;
-      const cutoff = new Date(rows[rows.length - 1].date);
-      cutoff.setDate(cutoff.getDate() - days);
-      return rows.filter(row => new Date(row.date) >= cutoff);
+      const cutoff = new Date(`${rows[rows.length - 1].date}T00:00:00Z`);
+      if (range === "6m") cutoff.setUTCMonth(cutoff.getUTCMonth() - 6);
+      else cutoff.setUTCFullYear(cutoff.getUTCFullYear() - ({ "1y": 1, "3y": 3, "5y": 5, "10y": 10, "20y": 20 }[range] || 1));
+      const cutoffDate = cutoff.toISOString().slice(0, 10);
+      return rows.filter(row => row.date >= cutoffDate);
     }
 
     function setCanvasSize() {
@@ -678,6 +786,11 @@
 
     function drawChart(rows) {
       setCanvasSize();
+      if (!rows.length) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        points = [];
+        return;
+      }
       const visibleRows = filterRows(rows, activeRange);
       const rect = canvas.getBoundingClientRect();
       const width = rect.width;
@@ -802,16 +915,27 @@
     }
 
     function render() {
-      if (!series[selectedSymbol]) selectedSymbol = symbols[0].symbol;
+      if (!symbols.length) return;
+      const version = ++requestVersion;
+      if (!symbols.some(item => item.symbol === selectedSymbol)) selectedSymbol = symbols[0].symbol;
+      const isIndex = ["QQQ", "SPY"].includes(selectedSymbol);
+      document.querySelectorAll("#rangeButtons [data-index-history]").forEach(button => { button.hidden = !isIndex; });
+      if (!isIndex && ["10y", "20y", "all"].includes(activeRange)) activeRange = "5y";
+      document.querySelectorAll("#rangeButtons button").forEach(button => button.classList.toggle("active", button.dataset.range === activeRange));
       const meta = getMeta(selectedSymbol);
       const rows = getRows(selectedSymbol);
-      const latest = rows[rows.length - 1];
+      const latest = meta.latest;
+      retryButton.hidden = true;
       renderSymbols();
       renderSummary(meta, latest, rows);
       renderRankings();
       renderHistory(rows);
       drawChart(rows);
       tooltip.style.display = "none";
+      if (!rows.length || (!fullHistory.has(selectedSymbol) && ["3y", "5y", "10y", "20y", "all"].includes(activeRange))) {
+        document.querySelector("#chartSubtitle").textContent = `${meta.index} · ${meta.sector} · 历史数据加载中`;
+        loadHistory(selectedSymbol, version);
+      }
     }
 
     searchInput.addEventListener("input", renderSymbols);
@@ -823,10 +947,11 @@
       if (event.target.tagName !== "BUTTON") return;
       activeRange = event.target.dataset.range;
       document.querySelectorAll("#rangeButtons button").forEach(button => button.classList.toggle("active", button === event.target));
-      drawChart(getRows(selectedSymbol));
+      render();
     });
 
-    render();
+    retryButton.addEventListener("click", () => retryAction());
+    start();
   </script>
 </body>
 </html>

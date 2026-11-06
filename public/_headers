@@ -1,0 +1,8 @@
+/data/market_priority.json
+  Cache-Control: public, max-age=0, must-revalidate
+
+/data/market_summary.*.json
+  Cache-Control: public, max-age=31536000, immutable
+
+/data/series/*
+  Cache-Control: public, max-age=31536000, immutable

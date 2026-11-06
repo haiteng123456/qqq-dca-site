@@ -1,37 +1,54 @@
-name: Update market DCA site
+name: Update QQQ and SPY on Cloudflare
 
 on:
   schedule:
-    # 22:30 UTC is 06:30 Beijing time on the next calendar day.
-    - cron: "30 22 * * 1-5"
+    # Beijing 06:17 and a backup at 07:47, Tuesday through Saturday.
+    # Both are after the US close in standard time and daylight saving time.
+    - cron: "17 22 * * 1-5"
+    - cron: "47 23 * * 1-5"
   workflow_dispatch:
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
+  group: cloudflare-production
   cancel-in-progress: false
 
 jobs:
   update-data:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Update market data
-        run: python scripts/update_qqq.py
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Update only QQQ and SPY
+        run: python scripts/update_qqq.py --symbols QQQ,SPY
+      - name: Validate data and loading behavior
+        run: |
+          python -m unittest discover -s scripts -p 'test_*.py'
+          node --test scripts/test-loading.mjs
+          python scripts/verify_site.py
       - name: Commit data changes
-        uses: stefanzweifel/git-auto-commit-action@v5
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data public/data
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update QQQ and SPY closing data'
+            git push origin HEAD:main
+          fi
+      - name: Deploy to existing Cloudflare Pages site
+        uses: cloudflare/wrangler-action@v4
         with:
-          commit_message: "Update market 180-day DCA data"
-          file_pattern: "data/**/*.csv data/*.csv public/data/*"
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: public
-      - uses: actions/deploy-pages@v4
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: "4.116.0"
+          command: pages deploy public --project-name qqq-dca-site --branch main --commit-dirty=true
+      - name: Verify production data
+        run: python scripts/verify_site.py --url https://qqq-dca-site.pages.dev/
